@@ -20,7 +20,7 @@ X = df[[f"freq_{i}" for i in range(702)]].values.astype("float32")
 
 Y = np.vstack(df["y"].values).astype("int64")
 
-X_train, X_val, Y_train, Y_val = train_test_split(X, Y, test_size=0.15, random_state=42)
+X_train, X_val, Y_train, Y_val = train_test_split(X, Y, test_size=0.15, random_state=2025)
 
 class Mydataset(Dataset):
     def __init__(self, X, Y):
@@ -109,9 +109,70 @@ class CNNPermNet(nn.Module):
 
         probs = torch.softmax(logits, dim=2)
         return logits, probs
+
+# 更改为transformer
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+from scipy.optimize import linear_sum_assignment  # 你的Hungarian
+
+
+class TransformerPermNet(nn.Module):
+    def __init__(self, d_model=256, nhead=8, num_layers=3, dim_feedforward=512, dropout=0.1):
+        super().__init__()
+        self.d_model = d_model
+
+        # 输入嵌入：unigram (B,26) + bigram (B,26,26) → 每个cipher pos嵌入 (26-dim unigram_slice + 26-dim bigram_row)
+        self.input_proj = nn.Linear(52, d_model)  # 26 uni + 26 bi per cipher → d_model
+
+        # 位置编码（a-z顺序）
+        self.pos_encoder = nn.Parameter(torch.zeros(1, 27, d_model))  # 26 cipher + 1 global uni
+
+        # Transformer Encoder：处理cipher序列 (27 tokens)
+        encoder_layer = nn.TransformerEncoderLayer(d_model, nhead, dim_feedforward, dropout, batch_first=True)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers)
+
+        # 输出头：encoder out (B,27,d_model) → 取前26 cipher tokens → (B,26,d_model) → 线性到26 plain
+        self.output_head = nn.Linear(d_model, 26)
+
+        # LayerNorm & Dropout
+        self.norm = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        """
+        x: (B, 702) = (B,26 uni + 676 bi)
+        """
+        B = x.size(0)
+        uni = x[:, :26]  # (B,26)
+        bi = x[:, 26:].view(B, 26, 26)  # (B,26_cipher,26_plain_cond)
+
+        # 为每个cipher pos构建嵌入：uni[pos] + bi[pos, :] (cond dist)
+        embeds = torch.cat([uni.unsqueeze(1).expand(-1, 26, -1), bi], dim=-1)  # (B,26,52)
+        embeds = self.input_proj(embeds)  # (B,26,d_model)
+
+        # 加位置编码（cipher 0-25）
+        seq_len = 26
+        pos = torch.arange(seq_len, dtype=torch.long, device=x.device).unsqueeze(0).expand(B, -1)
+        embeds = embeds + self.pos_encoder[:, :seq_len, :]  # 简化，无global token
+
+        embeds = self.dropout(self.norm(embeds))
+
+        # Encoder
+        enc_out = self.transformer_encoder(embeds)  # (B,26,d_model)
+
+        # 输出：每个cipher的注意力后，线性到plain logits
+        logits = self.output_head(enc_out)  # (B,26,26)
+        probs = F.softmax(logits, dim=-1)
+
+        return logits, probs
+
+
 device = "cuda" if torch.cuda.is_available() else "cpu"
+#model = TransformerPermNet(d_model=128, nhead=4, num_layers=2).to(device)
 model = CNNPermNet().to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3,weight_decay=1e-4)
 criterion = nn.CrossEntropyLoss()
 #scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau()
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -174,7 +235,8 @@ for epoch in range(1, EPOCHS+1):
         for Xb, Yb in val_loader:
             Xb = Xb.to(device)
             logits, probs = model(Xb)
-
+            #防止非法数据
+            #probs = torch.clamp(probs, min=1e-8)
             preds = hungarian_decode(probs)
             all_pred.append(preds)
             all_true.append(Yb.numpy())
@@ -185,5 +247,6 @@ for epoch in range(1, EPOCHS+1):
     key_acc = evaluate_key_accuracy(all_true, all_pred)
     scheduler.step(key_acc)
     print(f"[Epoch {epoch}/{EPOCHS}] loss={total_loss:.4f} | key-accuracy={key_acc:.4f}")
-
+full_acc = np.mean(np.all(all_true == all_pred, axis=1))
+print(f"Full key match rate: {full_acc:.4f}")
 print("训练完成！")
