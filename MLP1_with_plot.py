@@ -9,7 +9,7 @@ from scipy.optimize import linear_sum_assignment
 
 
 df_train,df_val=pd.read_csv("./new_data/new_dataset_train.csv"),pd.read_csv("./new_data/new_dataset_valid.csv")
-df_train=df_train[:7000]
+#df_train=df_train[:7000]
 df_train["inv_key"]=df_train["inv_key"].apply(lambda x: literal_eval(x))
 df_val["inv_key"] = df_val["inv_key"].apply(lambda x: literal_eval(x))
 def convert_to_int_list(key):
@@ -112,6 +112,147 @@ class CNNPermNet(nn.Module):
         probs = torch.softmax(logits, dim=2)
         return logits, probs
 
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# ---------------------------
+# 1. ResNet bottleneck block
+# ---------------------------
+class Bottleneck(nn.Module):
+    def __init__(self, in_c, out_c, downsample=False):
+        super().__init__()
+        mid = out_c // 2
+
+        stride = 2 if downsample else 1
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_c, mid, kernel_size=1, bias=False),
+            nn.BatchNorm2d(mid),
+            nn.ReLU(),
+
+            nn.Conv2d(mid, mid, kernel_size=3, padding=1, stride=stride, bias=False),
+            nn.BatchNorm2d(mid),
+            nn.ReLU(),
+
+            nn.Conv2d(mid, out_c, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_c),
+        )
+
+        self.shortcut = nn.Sequential()
+        if downsample or in_c != out_c:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_c, out_c, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_c)
+            )
+
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        return self.relu(self.conv(x) + self.shortcut(x))
+
+
+# ---------------------------
+# 2. Attention Pooling
+# ---------------------------
+class AttentionPool(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.query = nn.Parameter(torch.randn(1, dim))
+
+    def forward(self, x):
+        # x: (B, C, H, W)
+        B, C, H, W = x.shape
+        x = x.view(B, C, H * W).transpose(1, 2)  # (B, HW, C)
+
+        att = torch.softmax((x @ self.query.T).squeeze(-1), dim=1)  # (B, HW)
+        pooled = (x * att.unsqueeze(-1)).sum(dim=1)  # (B, C)
+        return pooled
+
+
+# ---------------------------
+# 3. Unigram Feature Mixer
+# ---------------------------
+class UniMixer(nn.Module):
+    def __init__(self, dim=26, hidden=128):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+        )
+
+    def forward(self, x):
+        return self.mlp(x)  # (B, hidden)
+
+
+# ---------------------------
+# 4. The New CNNPermNet-V2
+# ---------------------------
+class CNNPermNetV2(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        # ▶ Bigram 26×26 → ResNet backbone
+        self.stem = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+        )
+
+        self.layer1 = Bottleneck(32, 64, downsample=True)   # 26→13
+        self.layer2 = Bottleneck(64, 128, downsample=True)  # 13→7
+        self.layer3 = Bottleneck(128, 128)
+
+        # Attention pooling on final CNN features
+        self.att_pool = AttentionPool(128)
+
+        # ▶ Unigram feature mixer (stronger than your MLP)
+        self.uni_mixer = UniMixer(dim=26, hidden=128)
+
+        # ▶ Fusion MLP
+        self.fusion = nn.Sequential(
+            nn.Linear(128 + 128, 512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, 1024),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(1024, 26 * 26),
+        )
+
+    def forward(self, x):
+        """
+        输入 x: (B, 702)
+        前 26 → unigram
+        后 676 → bigram 26×26
+        """
+        B = x.size(0)
+        uni = x[:, :26]                    # (B,26)
+        bi = x[:, 26:].view(B, 1, 26, 26)  # (B,1,26,26)
+
+        # CNN bigram path
+        out = self.stem(bi)
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+
+        cnn_feat = self.att_pool(out)  # (B,128)
+
+        # Unigram path
+        uni_feat = self.uni_mixer(uni)  # (B,128)
+
+        # Fusion
+        feat = torch.cat([cnn_feat, uni_feat], dim=1)
+
+        logits = self.fusion(feat)
+        logits = logits.view(-1, 26, 26)
+        probs = torch.softmax(logits, dim=2)
+        return logits, probs
+
 # 更改为transformer
 import torch
 import torch.nn as nn
@@ -172,8 +313,9 @@ class TransformerPermNet(nn.Module):
 
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-model = TransformerPermNet(d_model=128, nhead=4, num_layers=2).to(device)
-#model = CNNPermNet().to(device)
+#model = TransformerPermNet(d_model=128, nhead=4, num_layers=2).to(device)
+model = CNNPermNet().to(device)
+#model = CNNPermNetV2().to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-3,weight_decay=1e-4)
 criterion = nn.CrossEntropyLoss()
 #scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau()
@@ -210,7 +352,12 @@ def evaluate_key_accuracy(true_keys, pred_keys):
     return np.mean(acc_per_sample)
 
 EPOCHS = 100
+import matplotlib.pyplot as plt
 
+train_loss_list = []
+val_acc_list = []
+lr_list = []
+full_match_rate_list = []
 for epoch in range(1, EPOCHS+1):
     model.train()
     total_loss = 0
@@ -220,12 +367,12 @@ for epoch in range(1, EPOCHS+1):
 
         logits, _ = model(Xb)
 
-        # 26个交叉熵
         loss = sum(criterion(logits[:, i, :], Yb[:, i]) for i in range(26)) / 26
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+
         total_loss += loss.item()
 
     # ---- Validation ----
@@ -237,8 +384,6 @@ for epoch in range(1, EPOCHS+1):
         for Xb, Yb in val_loader:
             Xb = Xb.to(device)
             logits, probs = model(Xb)
-            #防止非法数据
-            #probs = torch.clamp(probs, min=1e-8)
             preds = hungarian_decode(probs)
             all_pred.append(preds)
             all_true.append(Yb.numpy())
@@ -247,8 +392,18 @@ for epoch in range(1, EPOCHS+1):
     all_true = np.vstack(all_true)
 
     key_acc = evaluate_key_accuracy(all_true, all_pred)
+    full_match_rate = np.mean(np.all(all_true == all_pred, axis=1))
+
     scheduler.step(key_acc)
-    print(f"[Epoch {epoch}/{EPOCHS}] loss={total_loss:.4f} | key-accuracy={key_acc:.4f}")
+
+
+    train_loss_list.append(total_loss)
+    val_acc_list.append(key_acc)
+    full_match_rate_list.append(full_match_rate)
+    lr_list.append(optimizer.param_groups[0]["lr"])
+
+    print(f"[Epoch {epoch}/{EPOCHS}] loss={total_loss:.4f} | key-accuracy={key_acc:.4f} | full-match={full_match_rate:.4f}")
+
 full_acc = np.mean(np.all(all_true == all_pred, axis=1))
 print(f"Full key match rate: {full_acc:.4f}")
 print("训练完成！")
@@ -283,3 +438,52 @@ all_true = np.vstack(all_true)
 key_acc = evaluate_key_accuracy(all_true, all_pred)
 scheduler.step(key_acc)
 print(f"key-accuracy_test={key_acc:.4f}")
+
+
+# =============================
+# Plot 1: Train Loss
+# =============================
+plt.figure(figsize=(8,5))
+plt.plot(train_loss_list, label="Train Loss")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.title("Training Loss Curve")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# =============================
+# Plot 2: Validation Key Accuracy
+# =============================
+plt.figure(figsize=(8,5))
+plt.plot(val_acc_list, label="Val Key Accuracy")
+plt.xlabel("Epoch")
+plt.ylabel("Accuracy")
+plt.title("Validation Accuracy (Key Match)")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# =============================
+# Plot 3: Full Match Rate (Optional)
+# =============================
+plt.figure(figsize=(8,5))
+plt.plot(full_match_rate_list, label="Full Key Match Rate")
+plt.xlabel("Epoch")
+plt.ylabel("Full Match Rate")
+plt.title("Full Key Match Accuracy")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# =============================
+# Plot 4: Learning Rate (Optional)
+# =============================
+plt.figure(figsize=(8,5))
+plt.plot(lr_list, label="Learning Rate")
+plt.xlabel("Epoch")
+plt.ylabel("LR")
+plt.title("Learning Rate Schedule")
+plt.legend()
+plt.grid(True)
+plt.show()
