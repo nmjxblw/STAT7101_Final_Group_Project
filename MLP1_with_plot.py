@@ -118,139 +118,117 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-# ---------------------------
-# 1. ResNet bottleneck block
-# ---------------------------
-class Bottleneck(nn.Module):
-    def __init__(self, in_c, out_c, downsample=False):
+class ImprovedCNNPermNet(nn.Module):
+    def __init__(self, d_row=64, d_col=64, d_local=64, uni_dim=64, hidden=512, dropout=0.3, tau=0.8):
         super().__init__()
-        mid = out_c // 2
+        self.tau = tau
 
-        stride = 2 if downsample else 1
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_c, mid, kernel_size=1, bias=False),
-            nn.BatchNorm2d(mid),
+        # 分支一：整行卷积（捕捉每个 cipher 行的整列分布）
+        self.row_cnn = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=(1, 26)),  # 输出 (B,32,26,1)
             nn.ReLU(),
-
-            nn.Conv2d(mid, mid, kernel_size=3, padding=1, stride=stride, bias=False),
-            nn.BatchNorm2d(mid),
+            nn.BatchNorm2d(32),
+            nn.Conv2d(32, d_row, kernel_size=(1, 1)),  # 输出 (B,d_row,26,1)
             nn.ReLU(),
-
-            nn.Conv2d(mid, out_c, kernel_size=1, bias=False),
-            nn.BatchNorm2d(out_c),
+            nn.BatchNorm2d(d_row),
         )
 
-        self.shortcut = nn.Sequential()
-        if downsample or in_c != out_c:
-            self.shortcut = nn.Sequential(
-                nn.Conv2d(in_c, out_c, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(out_c)
-            )
-
-        self.relu = nn.ReLU()
-
-    def forward(self, x):
-        return self.relu(self.conv(x) + self.shortcut(x))
-
-
-# ---------------------------
-# 2. Attention Pooling
-# ---------------------------
-class AttentionPool(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.query = nn.Parameter(torch.randn(1, dim))
-
-    def forward(self, x):
-        # x: (B, C, H, W)
-        B, C, H, W = x.shape
-        x = x.view(B, C, H * W).transpose(1, 2)  # (B, HW, C)
-
-        att = torch.softmax((x @ self.query.T).squeeze(-1), dim=1)  # (B, HW)
-        pooled = (x * att.unsqueeze(-1)).sum(dim=1)  # (B, C)
-        return pooled
-
-
-# ---------------------------
-# 3. Unigram Feature Mixer
-# ---------------------------
-class UniMixer(nn.Module):
-    def __init__(self, dim=26, hidden=128):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, hidden),
+        # 分支二：整列卷积（捕捉跨行的列模式）
+        self.col_cnn = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=(26, 1)),  # 输出 (B,32,1,26)
             nn.ReLU(),
+            nn.BatchNorm2d(32),
+            nn.Conv2d(32, d_col, kernel_size=(1, 1)),  # 输出 (B,d_col,1,26)
+            nn.ReLU(),
+            nn.BatchNorm2d(d_col),
+        )
+
+        # 分支三：局部 3×3 卷积（捕捉邻域 bigram 模式）
+        self.local_cnn = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.BatchNorm2d(32),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.BatchNorm2d(32),
+            nn.Conv2d(32, d_local, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.BatchNorm2d(d_local),
+        )
+
+        # 将三路特征融合为行级 token（26 个 token）
+        # row_features: (B, d_row, 26, 1) → (B, 26, d_row)
+        # col_features: (B, d_col, 1, 26) → 转置后作为列上下文，再聚合为每行的统计
+        # local_features: (B, d_local, 26, 26) → 对列做池化得到每行局部摘要
+        self.row_pool = nn.AdaptiveAvgPool2d((26, 1))   # 保留26行，压列到1
+        self.col_pool = nn.AdaptiveAvgPool2d((1, 26))   # 保留26列，压行为1
+        self.local_row_pool = nn.AdaptiveAvgPool2d((26, 1))  # 对局部特征按列池化
+
+        # unigram 映射到行级标量/小向量
+        self.unigram_mlp = nn.Sequential(
+            nn.Linear(26, uni_dim),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(uni_dim, uni_dim)
+        )
+
+        # 行级 token 的融合 MLP
+        # 每个行 token 的维度 = d_row + d_col + d_local + uni_dim
+        token_dim = d_row + d_col + d_local + uni_dim
+        self.token_proj = nn.Sequential(
+            nn.Linear(token_dim, hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden, hidden),
             nn.ReLU(),
+            nn.Dropout(dropout),
         )
 
-    def forward(self, x):
-        return self.mlp(x)  # (B, hidden)
+        # 列原型（26 个 plain 列的原型向量）
+        self.col_prototypes = nn.Parameter(torch.randn(26, hidden))
 
-
-# ---------------------------
-# 4. The New CNNPermNet-V2
-# ---------------------------
-class CNNPermNetV2(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-        # ▶ Bigram 26×26 → ResNet backbone
-        self.stem = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-        )
-
-        self.layer1 = Bottleneck(32, 64, downsample=True)   # 26→13
-        self.layer2 = Bottleneck(64, 128, downsample=True)  # 13→7
-        self.layer3 = Bottleneck(128, 128)
-
-        # Attention pooling on final CNN features
-        self.att_pool = AttentionPool(128)
-
-        # ▶ Unigram feature mixer (stronger than your MLP)
-        self.uni_mixer = UniMixer(dim=26, hidden=128)
-
-        # ▶ Fusion MLP
-        self.fusion = nn.Sequential(
-            nn.Linear(128 + 128, 512),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(512, 1024),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(1024, 26 * 26),
-        )
+        # 归一化与轻微输出 MLP（可选）
+        self.token_norm = nn.LayerNorm(hidden)
+        self.out_norm = nn.LayerNorm(hidden)
 
     def forward(self, x):
         """
-        输入 x: (B, 702)
-        前 26 → unigram
-        后 676 → bigram 26×26
+        x: (B, 702) = [26 unigram | 26*26 bigram]
+        返回：
+            logits: (B, 26, 26)
+            probs:  (B, 26, 26)
         """
         B = x.size(0)
-        uni = x[:, :26]                    # (B,26)
-        bi = x[:, 26:].view(B, 1, 26, 26)  # (B,1,26,26)
+        uni = x[:, :26]                          # (B, 26)
+        bi = x[:, 26:].view(B, 1, 26, 26)        # (B, 1, 26, 26)
 
-        # CNN bigram path
-        out = self.stem(bi)
-        out = self.layer1(out)
-        out = self.layer2(out)
-        out = self.layer3(out)
+        # 三路 CNN
+        row_feat = self.row_cnn(bi)              # (B, d_row, 26, 1)
+        col_feat = self.col_cnn(bi)              # (B, d_col, 1, 26)
+        local_feat = self.local_cnn(bi)          # (B, d_local, 26, 26)
 
-        cnn_feat = self.att_pool(out)  # (B,128)
+        # 池化到行级视角
+        row_feat = row_feat.view(B, -1, 26)      # (B, d_row, 26)
+        row_feat = row_feat.transpose(1, 2)      # (B, 26, d_row)
 
-        # Unigram path
-        uni_feat = self.uni_mixer(uni)  # (B,128)
+        col_feat = col_feat.view(B, -1, 26)      # (B, d_col, 26)
+        col_feat = col_feat.transpose(1, 2)      # (B, 26, d_col)
 
-        # Fusion
-        feat = torch.cat([cnn_feat, uni_feat], dim=1)
+        local_row = self.local_row_pool(local_feat)   # (B, d_local, 26, 1)
+        local_row = local_row.view(B, -1, 26).transpose(1, 2)  # (B, 26, d_local)
 
-        logits = self.fusion(feat)
-        logits = logits.view(-1, 26, 26)
-        probs = torch.softmax(logits, dim=2)
+        # unigram 行级特征：为每个行 token 提供全局频率的嵌入（复制到每行）
+        uni_emb = self.unigram_mlp(uni)          # (B, uni_dim)
+        uni_rows = uni_emb.unsqueeze(1).expand(B, 26, uni_emb.size(-1))  # (B,26,uni_dim)
+
+        # 融合为行 token
+        tokens = torch.cat([row_feat, col_feat, local_row, uni_rows], dim=-1)  # (B,26, token_dim)
+        tokens = self.token_proj(tokens)                                        # (B,26, hidden)
+        tokens = self.token_norm(tokens)
+
+        # 与列原型做匹配得到 logits
+        logits = torch.matmul(self.out_norm(tokens), self.col_prototypes.t())   # (B,26,26)
+        probs = F.softmax(logits / self.tau, dim=-1)
         return logits, probs
 
 # 更改为transformer
@@ -314,8 +292,8 @@ class TransformerPermNet(nn.Module):
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 #model = TransformerPermNet(d_model=128, nhead=4, num_layers=2).to(device)
-model = CNNPermNet().to(device)
-#model = CNNPermNetV2().to(device)
+#model = CNNPermNet().to(device)
+model = ImprovedCNNPermNet().to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-3,weight_decay=1e-4)
 criterion = nn.CrossEntropyLoss()
 #scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau()
